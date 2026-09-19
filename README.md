@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；并提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验。
 
 ## 校验规则（状态机）
 
@@ -192,6 +192,101 @@ curl -s http://localhost:8000/api/v1/seal-chain/batch-validate \
       ]}'
 ```
 
+### `POST /api/v1/seal-chain/reconcile-validate`
+
+离线片段合并重建。同一条链（同一 `chain_id`）在离线状态下被拆成多个片段分别记录，本接口将其合并为唯一序列后再校验。处理分四步：
+
+1. **按 `event_id` 去重**：同一 `event_id` 的多个拷贝业务内容（`type` / `timestamp` / `seal_id` / `custodian` / `prev_event_id`）完全相同时仅保留一份；内容存在分歧时记入 `conflicts` 冲突明细，冲突事件不参与后续重建。
+2. **按 `prev_event_id` 重建唯一序列**：仅基于无冲突事件，显式检测**多头**（`prev_event_id` 为 `null` 的链头必须恰好一个）、**缺失前驱**、**分叉**（多个事件共用同一前驱）、**环**；**绝不按时间戳猜测顺序**。
+3. **仅重建成功时**（无冲突、恰好一个链头、无缺失前驱、无分叉、无环）按重建序列调用现有单链校验器，时间戳严格递增等规则仍由该校验器判定；否则 `sequence` 与 `validation` 为 `null`。
+4. 无论是否重建成功，都返回每个 `event_id` 的**来源片段编号列表**。
+
+**请求体**
+
+```json
+{
+  "chain_id": "chain-a",
+  "fragments": [
+    {
+      "events": [
+        {"event_id": "e1", "prev_event_id": null, "type": "seal",     "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"},
+        {"event_id": "e2", "prev_event_id": "e1", "type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
+      ]
+    },
+    {
+      "events": [
+        {"event_id": "e2", "prev_event_id": "e1", "type": "handover", "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"},
+        {"event_id": "e3", "prev_event_id": "e2", "type": "unseal",   "timestamp": "2026-09-18T12:00:00Z"}
+      ]
+    }
+  ]
+}
+```
+
+- `chain_id`：链标识，所有片段必须属于同一条链
+- `fragments[]`：离线片段，**片段编号即其在请求中的下标（从 0 开始）**
+- 事件字段在单链事件基础上增加：`event_id`（必填，判重依据）、`prev_event_id`（前驱事件标识，`null` 表示链头）
+
+**响应示例**（对应上例，两个片段的 `e2` 完全一致，被合并）
+
+```json
+{
+  "chain_id": "chain-a",
+  "reconciled": true,
+  "conflicts": [],
+  "structure": {"heads": ["e1"], "missing_predecessors": [], "forks": [], "cycles": []},
+  "sequence": ["e1", "e2", "e3"],
+  "validation": {
+    "valid": true,
+    "sealed": false,
+    "final_custodian": "Bob",
+    "current_seal": null,
+    "events": [
+      {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 1, "type": "handover", "status": "ok", "reason": null, "cross_chain_conflict": false},
+      {"index": 2, "type": "unseal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+    ],
+    "violations": []
+  },
+  "event_sources": [
+    {"event_id": "e1", "fragments": [0]},
+    {"event_id": "e2", "fragments": [0, 1]},
+    {"event_id": "e3", "fragments": [1]}
+  ]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `reconciled` | 是否成功重建唯一序列：无内容冲突、恰好一个链头、无缺失前驱、无分叉、无环 |
+| `conflicts[]` | 同一 `event_id` 内容分歧的明细：`differing_fields` 列出分歧字段，`variants[]` 给出每种内容变体及其来源片段编号 |
+| `structure.heads[]` | `prev_event_id` 为 `null` 的链头事件，必须恰好一个才能重建 |
+| `structure.missing_predecessors[]` | 前驱不在无冲突事件集中的事件（前驱未出现，或因冲突被排除） |
+| `structure.forks[]` | 分叉：`prev_event_id` 及其全部后继事件 |
+| `structure.cycles[]` | 环：环内每个事件的 `prev_event_id` 依次指向列表下一事件，末尾指回开头 |
+| `sequence` | 重建成功时的 `event_id` 序列，否则为 `null` |
+| `validation` | 仅重建成功时调用现有单链校验器的结果（结构同单链接口，`index` 对应 `sequence` 中的位置），否则为 `null` |
+| `event_sources[]` | 每个 `event_id` 的来源片段编号列表（升序去重），按首次出现顺序排列；冲突事件也包含在内 |
+
+> 结构诊断（`structure`）只基于无冲突事件；时间戳只交给单链校验器按规则 5 判定，重建阶段不按时间戳排序。事件结构不合法（如缺少 `event_id`）返回 `422`。
+
+### 合并重建接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/reconcile-validate \
+  -H 'Content-Type: application/json' \
+  -d '{"chain_id": "chain-a", "fragments": [
+        {"events": [
+          {"event_id": "e1", "prev_event_id": null, "type": "seal",
+           "timestamp": "2026-09-18T10:00:00Z", "seal_id": "S001", "custodian": "Alice"}
+        ]},
+        {"events": [
+          {"event_id": "e2", "prev_event_id": "e1", "type": "handover",
+           "timestamp": "2026-09-18T11:00:00Z", "custodian": "Bob"}
+        ]}
+      ]}'
+```
+
 ## 本地开发与测试
 
 ```bash
@@ -205,12 +300,14 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链与批量）
+  models.py      # 请求 / 响应模型（单链、批量与合并重建）
   validator.py   # 单链状态机校验核心
   batch.py       # 批量封签占用检查（跨链冲突）
+  reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
 tests/
   test_validator.py
   test_batch.py
+  test_reconcile.py
 Dockerfile
 docker-compose.yml
 requirements.txt

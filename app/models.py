@@ -130,3 +130,103 @@ class BatchValidateResponse(BaseModel):
         default_factory=list,
         description="按 chain_id 稳定排序的批次汇总",
     )
+
+
+# ---------------------------------------------------------------------------
+# 离线片段合并重建（/api/v1/seal-chain/reconcile-validate）
+# ---------------------------------------------------------------------------
+
+
+class ReconcileEvent(Event):
+    """离线片段中的事件：在单链事件基础上增加链式标识。"""
+
+    event_id: str = Field(min_length=1, description="事件唯一标识，跨片段判重依据")
+    prev_event_id: Optional[str] = Field(
+        default=None, description="前驱事件标识；null 表示链头事件"
+    )
+
+
+class Fragment(BaseModel):
+    """同一 chain_id 的一个离线片段，其编号为在请求中的下标（从 0 开始）。"""
+
+    events: List[ReconcileEvent] = Field(default_factory=list)
+
+
+class ReconcileRequest(BaseModel):
+    """合并重建请求：同一 chain_id 的多个离线片段。"""
+
+    chain_id: str = Field(description="链标识，所有片段必须属于同一条链")
+    fragments: List[Fragment] = Field(default_factory=list)
+
+
+class EventVariant(BaseModel):
+    """同一 event_id 的一种内容变体及其来源片段。"""
+
+    fragments: List[int] = Field(description="该变体出现的片段编号（从 0 开始，升序去重）")
+    event: ReconcileEvent = Field(description="该变体的事件内容")
+
+
+class EventConflict(BaseModel):
+    """同一 event_id 出现内容分歧时的冲突明细。"""
+
+    event_id: str
+    differing_fields: List[str] = Field(description="各变体间存在分歧的字段名")
+    variants: List[EventVariant] = Field(description="全部内容变体，按首次出现顺序排列")
+
+
+class MissingPredecessor(BaseModel):
+    """缺失前驱：事件的 prev_event_id 在无冲突事件集中不存在。"""
+
+    event_id: str
+    prev_event_id: str
+
+
+class Fork(BaseModel):
+    """分叉：多个事件以同一事件为前驱。"""
+
+    prev_event_id: str
+    event_ids: List[str] = Field(description="以该事件为前驱的全部事件，按首次出现顺序")
+
+
+class StructureReport(BaseModel):
+    """按 prev_event_id 重建唯一序列时的结构诊断（仅基于无冲突事件）。"""
+
+    heads: List[str] = Field(description="prev_event_id 为 null 的链头事件；必须恰好一个")
+    missing_predecessors: List[MissingPredecessor] = Field(
+        default_factory=list, description="前驱不在无冲突事件集中的事件"
+    )
+    forks: List[Fork] = Field(default_factory=list, description="同一前驱被多个事件引用")
+    cycles: List[List[str]] = Field(
+        default_factory=list,
+        description="环：环内每个事件的 prev_event_id 依次指向列表下一事件，末尾指回开头",
+    )
+
+
+class EventSource(BaseModel):
+    """一个 event_id 的来源片段编号列表。"""
+
+    event_id: str
+    fragments: List[int] = Field(description="该事件出现的片段编号（从 0 开始，升序去重）")
+
+
+class ReconcileResponse(BaseModel):
+    """合并重建响应。"""
+
+    chain_id: str = Field(description="链标识，回显请求中的 chain_id")
+    reconciled: bool = Field(
+        description="是否成功重建唯一序列：无内容冲突、恰好一个链头、无缺失前驱、无分叉、无环"
+    )
+    conflicts: List[EventConflict] = Field(
+        default_factory=list, description="按 event_id 判重发现的内容冲突明细"
+    )
+    structure: StructureReport = Field(description="基于无冲突事件的结构诊断")
+    sequence: Optional[List[str]] = Field(
+        description="重建成功时的事件序列（event_id 顺序），否则为 null"
+    )
+    validation: Optional[ValidateResponse] = Field(
+        description="仅重建成功时调用现有单链校验器的结果；index 对应 sequence 中的位置"
+    )
+    event_sources: List[EventSource] = Field(
+        default_factory=list,
+        description="每个 event_id 的来源片段编号列表，按首次出现顺序排列",
+    )
