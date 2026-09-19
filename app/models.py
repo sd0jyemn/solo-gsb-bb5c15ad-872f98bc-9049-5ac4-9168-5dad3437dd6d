@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class EventType(str, Enum):
@@ -129,4 +129,133 @@ class BatchValidateResponse(BaseModel):
     summary: List[BatchChainSummary] = Field(
         default_factory=list,
         description="按 chain_id 稳定排序的批次汇总",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 离线片段对账重建（/api/v1/seal-chain/reconcile-validate）
+# ---------------------------------------------------------------------------
+
+
+class ReconcileEvent(Event):
+    """离线片段中的封签链事件，在原有业务字段外增加链内链接标识。
+
+    同一条链上的事件通过 event_id / prev_event_id 显式链接，
+    对账时仅按链接关系重建顺序，绝不按 timestamp 猜测顺序。
+    """
+
+    event_id: str = Field(description="事件在该 chain_id 内的唯一标识，不可为空字符串")
+    prev_event_id: Optional[str] = Field(
+        default=None,
+        description="前驱事件标识；链首事件为 null（或不传），不可为空字符串",
+    )
+
+    @field_validator("event_id", "prev_event_id")
+    @classmethod
+    def _id_must_not_be_blank(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("event_id / prev_event_id 不可为空白字符串")
+        return value
+
+
+class ReconcileFragment(BaseModel):
+    """同一 chain_id 的一个离线片段，fragment_index 由输入顺序隐式确定（从 0 开始）。"""
+
+    fragment_id: Optional[str] = Field(
+        default=None,
+        description="可选的片段业务标识，仅用于阅读，来源编号以输入下标 fragment_index 为准",
+    )
+    events: List[ReconcileEvent] = Field(default_factory=list)
+
+
+class ReconcileValidateRequest(BaseModel):
+    """对账请求：同一 chain_id 的多个离线片段。"""
+
+    chain_id: str = Field(description="本批次所有片段共同所属的链标识，不可为空字符串")
+    fragments: List[ReconcileFragment] = Field(default_factory=list)
+
+    @field_validator("chain_id")
+    @classmethod
+    def _chain_id_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("chain_id 不可为空白字符串")
+        return value
+
+
+class ReconcileConflictDetail(BaseModel):
+    """同一 event_id 但业务内容不一致的冲突明细。"""
+
+    event_id: str = Field(description="发生冲突的事件标识")
+    variants: List[dict] = Field(
+        description="去重后互不一致的事件内容（含 event_id 与 prev_event_id）"
+    )
+    fragment_indexes: List[int] = Field(
+        description="该 event_id 全部副本所在的来源片段编号（按输入顺序，去重升序）"
+    )
+
+
+class ReconcileGraphReport(BaseModel):
+    """前驱链接图（仅包含无内容冲突的事件）的结构诊断。"""
+
+    heads: List[str] = Field(
+        default_factory=list,
+        description="所有链头事件（prev_event_id 为 null）的 event_id",
+    )
+    multiple_heads: bool = Field(default=False, description="链头数量是否大于 1")
+    forks: List[dict] = Field(
+        default_factory=list,
+        description='分叉项：{"event_id": 被多个后继指向的事件, "successors": [后继 event_id]}'
+    )
+    missing_predecessors: List[dict] = Field(
+        default_factory=list,
+        description='缺失前驱项：{"event_id": 指向缺失前驱的事件, "missing_event_id": 缺失的前驱标识}'
+    )
+    cycles: List[List[str]] = Field(
+        default_factory=list,
+        description="环：每个元素为沿前驱方向排列的 event_id 环；整环旋转至最小标识开头，按最小标识排序"
+    )
+
+
+class ReconciledEventResult(EventResult):
+    """重建序列中单个事件的校验结果，附去重与来源信息。"""
+
+    event_id: str = Field(description="事件标识")
+    fragment_indexes: List[int] = Field(
+        description="该事件出现过的全部来源片段编号（输入顺序，去重升序）"
+    )
+    duplicate_copies: int = Field(
+        description="该 event_id 在所有片段中收到的原始副本数（内容完全一致）"
+    )
+
+
+class ReconcileValidateResponse(BaseModel):
+    """对账校验响应。"""
+
+    chain_id: str = Field(description="回显请求中的 chain_id")
+    reconciled: bool = Field(
+        description="对账是否成功：无内容冲突、链接图结构完整且唯一，并通过单链状态机校验"
+    )
+    valid: bool = Field(
+        description="重建序列的状态机校验结果；未成功重建时恒为 false"
+    )
+    received_events: int = Field(description="所有片段提交的原始事件副本总数")
+    unique_events: int = Field(description="无内容冲突的不同 event_id 数量（参与链接图分析）")
+    duplicates: int = Field(description="因内容完全一致而被合并掉的副本数")
+    conflicts: List[ReconcileConflictDetail] = Field(
+        default_factory=list, description="同 event_id 业务字段不一致的冲突明细"
+    )
+    graph: ReconcileGraphReport = Field(
+        default_factory=ReconcileGraphReport,
+        description="链接图结构诊断（仅在无内容冲突时生成；有冲突时各诊断列表为空）",
+    )
+    rebuilt: bool = Field(description="是否按 prev_event_id 成功重建出唯一序列")
+    events: List[ReconciledEventResult] = Field(
+        default_factory=list,
+        description="重建成功时，按重建顺序排列的逐事件状态机校验结果；否则为空列表",
+    )
+    sealed: bool = Field(default=False, description="重建链处理完所有有效事件后的封装状态")
+    final_custodian: Optional[str] = Field(default=None, description="重建链最终保管人")
+    current_seal: Optional[str] = Field(default=None, description="重建链当前有效封签")
+    violations: List[Violation] = Field(
+        default_factory=list, description="重建链的状态机违规（index 基于重建序列，从 0 开始）"
     )
